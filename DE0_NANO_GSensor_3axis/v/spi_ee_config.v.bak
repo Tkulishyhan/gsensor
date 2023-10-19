@@ -1,0 +1,369 @@
+module spi_ee_config (
+                                iRSTN,
+                                iSPI_CLK,
+                                iSPI_CLK_OUT,
+                                iG_INT2,
+                                oDATA_L,
+                                oDATA_H,
+										  oData_X,
+										  oDVal_X,
+										  oReadX,
+                                
+                                /* SPI 3wires */
+                                SPI_SDIO,
+                                oSPI_CSN,
+                                oSPI_CLK);
+
+//=======================================================
+//  PARAMETER declarations
+//=======================================================
+
+// 包含SPI相關的參數定義
+`include "spi_param.h"
+parameter GRun=0, GInit=1;
+
+    
+//=======================================================
+//  PORT declarations
+//=======================================================
+// 主機端的信號定義
+input iRSTN;  // 系統重置信號
+input iSPI_CLK, iSPI_CLK_OUT;  // SPI時鐘信號，分別為輸入和輸出
+input iG_INT2;  // 中斷信號
+output reg [SO_DataL-1:0] oDATA_L;  // 輸出數據的低位元組
+output reg [SO_DataL-1:0] oDATA_H;  // 輸出數據的高位元組
+output reg [15:0]       oData_X;  // 輸出數據X
+output reg        	   oDVal_X;
+output reg              oReadX;
+
+// SPI端的信號定義
+inout   SPI_SDIO;  // SPI的雙向數據線
+output  oSPI_CSN;  // SPI的片選信號
+output  oSPI_CLK;  // SPI的時鐘輸出信號
+                               
+//=======================================================
+//  REG/WIRE declarations
+//=======================================================
+reg     [3:0] 	         ini_index;
+reg     [SI_DataL-3:0]  write_data;
+reg     [SI_DataL-1:0]    p2s_data;
+reg                     spi_go;
+wire                    spi_end;
+wire    [SO_DataL-1:0]    s2p_data; 
+reg     [SO_DataL-1:0]    low_byte_data;
+reg                     spi_state;
+reg                     high_byte; // indicate to read the high or low byte
+reg                     read_back; // indicate to read back data 
+reg                     clear_status, read_ready;
+reg     [3:0]           clear_status_d;
+reg                     high_byte_d, read_back_d;
+reg	  [IDLE_MSB:0]    read_idle_count; // reducing the reading rate
+
+reg [1:0] 					GSensorState;
+//=======================================================
+//  Sub-module
+//=======================================================
+// SPI控制器的實例化
+// 這段程式碼創建了一個名為u_spi_controller的SPI控制器模組的實例。
+spi_controller u_spi_controller (
+                .iRSTN      (iRSTN),          // 系統重置信號輸入
+                .iSPI_CLK   (iSPI_CLK),       // SPI時鐘輸入
+                .iSPI_CLK_OUT(iSPI_CLK_OUT),  // 帶有相位偏移的SPI時鐘輸入
+                .iP2S_DATA  (p2s_data),       // 從主機到從機的數據輸入
+                .iSPI_GO    (spi_go),         // 啟動SPI傳輸的信號輸入
+                .oSPI_END   (spi_end),        // SPI傳輸結束的信號輸出
+                .oS2P_DATA  (s2p_data),       // 從從機到主機的數據輸出
+					 /* spi, 3-wires */
+                .SPI_SDIO   (SPI_SDIO),       // SPI的雙向數據線
+                .oSPI_CSN   (oSPI_CSN),       // SPI的片選信號輸出
+                .oSPI_CLK   (oSPI_CLK));      // SPI的時鐘輸出
+
+                        
+//=======================================================
+//  Structural coding
+//=======================================================
+// Initial Setting Table
+always @ (ini_index)
+    case (ini_index)
+        0      : write_data = {THRESH_ACT,      8'h20}; /* set act threshold 64 */
+        1      : write_data = {THRESH_INACT,    8'h03}; /* set INACT threshold 3 */
+        2      : write_data = {TIME_INACT,      8'h01}; /* set INACT time 1 */
+        3      : write_data = {ACT_INACT_CTL,   8'h7f}; /* 設定ACT為DC耦合，INACT為AC耦合，
+                                                           並致能ACT_x,y,z和INACT_x,y,z */
+        4      : write_data = {THRESH_FF,       8'h09};
+        5      : write_data = {TIME_FF,         8'h46};
+        6      : write_data = {BW_RATE,         8'h0F}; /* output data rate : 3200 Hz */
+        7      : write_data = {INT_ENABLE,      8'h10};
+        8      : write_data = {INT_MAP,         8'h10}; /*  設定Activity到INT2觸發 */
+        9      : write_data = {DATA_FORMAT,     8'b01001011};/* Register 0x31—DATA_FORMAT (Read/Write) 
+		                                                    SPI 3Wires mode, 
+																			 FULL_RES bit is set to 0, the device is in 10-bit mode, 
+																			 Justify Bit=0, 表示讀進來的數值是2補數數值
+																			 range bit=2'b00, 表示是使用+-2g範圍
+																	    */
+        default: write_data = {POWER_CONTROL,   8'h08};
+    endcase
+
+    // 此區塊處理SPI的狀態機，用於初始化和數據讀取操作。
+reg rReadX;
+always@(posedge iSPI_CLK or negedge iRSTN)
+    if(!iRSTN)begin
+        ini_index       <= 4'b0;
+        spi_go          <= 1'b0;
+        spi_state       <= IDLE;
+        read_idle_count <= 0;       // read mode only
+        high_byte       <= 1'b0;    // read mode only
+        read_back       <= 1'b0;    // read mode only
+        clear_status    <= 1'b0;
+		  GSensorState    <= GInit;
+		  oData_X <= 0;   oDVal_X <= 0;
+		  oReadX <= 0;
+    end
+    // initial setting (write mode)
+    else begin
+        ini_index       <= ini_index;     spi_go          <= spi_go;
+        spi_state       <= spi_state;     read_idle_count <= read_idle_count;       
+        high_byte       <= high_byte;     read_back       <= read_back;    
+        clear_status    <= clear_status;  GSensorState    <= GSensorState;
+		  oData_X <= oData_X;   oDVal_X <= 0; oReadX <= oReadX;
+	     case(GSensorState) 
+		      GInit: begin /* Initial G-sensor */
+				   if(ini_index < INI_NUMBER) 
+                  case(spi_state)
+                      IDLE : begin/* 將Initial Setting Table寫入到p2s_data */
+                           p2s_data    <= {WRITE_MODE, write_data}; 
+                           spi_go      <= 1'b1;
+                           spi_state   <= TRANSFER;
+                        end
+                      TRANSFER : begin
+                           if (spi_end) begin
+                              ini_index   <= ini_index + 4'b1;
+                              spi_go  <= 1'b0;
+                              spi_state   <= IDLE;
+									end
+                        end
+                  endcase
+				   else begin
+					   GSensorState <= GRun;
+					end
+				end/* GInit end */
+				GRun: begin // read data and clear interrupt (read mode)
+					case(spi_state)
+						IDLE : begin
+								// 增加閒置讀取計數器的值
+							 read_idle_count <= read_idle_count + 1;
+                      oReadX <= 0;
+							 
+							/* Step1: 
+							         high_byte: read high byte
+									   read_ready: Gsensor data ready
+										read_idle_count: Time out
+										(!clear_status_d[3] && iG_INT2): INT2 Interrupt 
+									*/
+//							if (high_byte || read_ready || read_idle_count[IDLE_MSB] || (!clear_status_d[3] && iG_INT2)) begin
+//								  // 啟動SPI傳輸
+//								  spi_go    <= 1'b1;
+//								  // 設置SPI狀態為傳輸
+//								  spi_state <= TRANSFER;
+//							end
+							
+							/* Step1: if G-sensor data read_ready, then read the register value */
+							 if (high_byte) begin 
+								  // 設置從主機到從機的數據為讀取模式和高位元組地址
+								  p2s_data[15:8] <= {READ_MODE, X_HB};
+								  read_back      <= 1'b1; /* 設置讀取回傳標誌 */
+								  oReadX <= 1;
+								  // 啟動SPI傳輸
+								  spi_go    <= 1'b1;
+								  // 設置SPI狀態為傳輸
+								  spi_state <= TRANSFER;
+							 end
+							 else if (read_ready) begin/*  g-sensor data ready to read  */
+								  // 設置從主機到從機的數據為讀取模式和低位元組地址
+								  p2s_data[15:8] <= {READ_MODE, X_LB};
+								  read_back      <= 1'b1;
+								  oReadX <= 1;
+								  // 啟動SPI傳輸
+								  spi_go    <= 1'b1;
+								  // 設置SPI狀態為傳輸
+								  spi_state <= TRANSFER;
+							 end
+							 // 如果中斷源未清除且有G感測器中斷，或者閒置讀取計數器達到最大值
+							 else if ((!clear_status_d[3] && iG_INT2) || read_idle_count[IDLE_MSB]) begin
+								  // 設置從主機到從機的數據為讀取模式和中斷源地址
+								  p2s_data[15:8] <= {READ_MODE, INT_SOURCE};
+								  // 設置清除狀態標誌
+								  clear_status   <= 1'b1;
+								  // 啟動SPI傳輸
+								  spi_go    <= 1'b1;
+								  // 設置SPI狀態為傳輸
+								  spi_state <= TRANSFER;
+							 end
+							 
+							 /* if 如果有讀取回傳數據*/
+							 if (read_back_d) begin
+								  // 如果是高位元組
+								  if (high_byte_d) begin
+										// 更新高位元組和低位元組的數據
+										oDATA_H <= s2p_data;
+										oDATA_L <= low_byte_data;
+										if(oReadX) begin
+											oData_X <= {s2p_data, low_byte_data};   
+											oDVal_X <= 1;
+										end
+								  end
+								  // 如果是低位元組
+								  else
+										low_byte_data <= s2p_data;
+							 end
+							 
+						end
+						TRANSFER : begin
+								   if (spi_end) begin
+										spi_go      <= 1'b0;
+										spi_state   <= IDLE;
+										read_idle_count <= 0;										
+										if (read_back) begin /* read G-sensor x, y, z value */
+											 read_back <= 1'b0;
+											 high_byte <= !high_byte;
+											 read_ready <= 1'b0;
+										end
+										else  begin /* read INT_SOURCE register */
+											clear_status <= 1'b0;
+											read_ready <= s2p_data[7]; /* check INT_SOURCE register DATA_READY bit 
+											                              if SINGLE_TAP is set, get X,Y,Z-asix value 
+											                           */
+						            end
+								   end
+						end
+				  endcase
+				end /* GRun  */ 	
+		  endcase /* case(GSensorState)  */ 
+	  end /* if(!iRSTN) else */
+
+  
+ 
+
+// 此區塊更新一些標誌和狀態寄存器。
+always@(posedge iSPI_CLK or negedge iRSTN)
+    if(!iRSTN) begin
+        high_byte_d <= 1'b0;
+        read_back_d <= 1'b0;
+        clear_status_d <= 4'b0;
+    end
+    else begin
+        high_byte_d <= high_byte;
+        read_back_d <= read_back;
+        clear_status_d <= {clear_status_d[2:0], clear_status};
+    end
+
+endmodule
+
+/*
+        0      : write_data = {THRESH_ACT,      8'h20};  設定動作閾值 64 
+        1      : write_data = {THRESH_INACT,    8'h03};  設定不動作閾值 3
+        2      : write_data = {TIME_INACT,      8'h01};  設定不動做時間 1 
+        3      : write_data = {ACT_INACT_CTL,   8'h7f}; 設定不動做時間 1 
+                                                        設定ACT為DC耦合，INACT為AC耦合，
+                                                        並致能ACT_x,y,z和INACT_x,y,z 
+        4      : write_data = {THRESH_FF,       8'h09};
+        5      : write_data = {TIME_FF,         8'h46};
+        6      : write_data = {BW_RATE,         8'h0F}; // output data rate : 3200 Hz 
+        7      : write_data = {INT_ENABLE,      8'h10};
+        8      : write_data = {INT_MAP,         8'h00};
+        9      : write_data = {DATA_FORMAT,     8'b01001011};
+
+Register 0x1D—THRESH_TAP (讀/寫)
+   THRESH_TAP 暫存器是8位元，用於保存敲擊中斷的閾值。其數據格式是無符號的，因此，敲擊事件的大小會與 THRESH_TAP 中的值進行比較，
+	以進行正常的敲擊檢測。其比例因子是62.5 mg/LSB（即，0xFF = 16 g）。如果啟用單次敲擊/雙次敲擊中斷，值為0可能會導致不希望的行為。
+
+Register 0x1E, Register 0x1F, Register 0x20—OFSX, OFSY, OFSZ (讀/寫)
+   OFSX、OFSY 和 OFSZ 暫存器都是8位元，提供用戶設置的偏移調整，其格式是二補數格式，比例因子是15.6 mg/LSB（即，0x7F = 2 g）。
+	存儲在偏移暫存器中的值會自動添加到加速度數據中，並將結果值存儲在輸出數據暫存器中。有關偏移校正和使用偏移暫存器的更多信息，請參考偏移校正部分。
+
+Register 0x21—DUR (讀/寫)
+   DUR 暫存器是8位元，包含一個無符號的時間值，表示一個事件必須超過 THRESH_TAP 閾值的最大時間，以符合敲擊事件的資格。
+	其比例因子是625 μs/LSB。值為0會禁用單次敲擊/雙次敲擊功能。
+
+Register 0x22—Latent (讀/寫)
+   Latent 暫存器是8位元，包含一個無符號的時間值，表示從檢測到敲擊事件到開始可能檢測到第二次敲擊事件的時間窗口（由窗口註冊器定義）的等待時間。
+	其比例因子是1.25 ms/LSB。值為0會禁用雙次敲擊功能。
+
+Register 0x23—Window (讀/寫)
+   Window 暫存器是8位元，包含一個無符號的時間值，表示在延遲時間過期後（由 latent 暫存器確定）期間，可以開始第二次有效敲擊的時間量。
+	其比例因子是1.25 ms/LSB。值為0會禁用雙次敲擊功能。
+
+Register 0x24—THRESH_ACT (Read/Write)
+   THRESH_ACT暫存器用於設定檢測到的動作或活動的閾值。當感測器檢測到的動作或活動的幅度超過這個閾值時，它會產生一個中斷或通知。
+	這個註冊器的數據格式是無符號的，這意味著它只能表示正數。每一位的增量或比例因子是62.5 mg，這意味著如果你在暫存器中設定了一個值，例如4，
+	那麼實際的閾值將是250 mg（4 x 62.5 mg）。如果這個值設定為0，並且活動中斷被啟用，那麼任何微小的動作都可能觸發中斷，這可能不是使用者所期望的行為。
+	因此，使用者應該根據他們的應用需求適當地設定這個閾值。
+	
+Register 0x25—THRESH_INACT (Read/Write)
+   THRESH_INACT註冊器用於設定檢測到的不活動或靜止的閾值。當感測器檢測到的不活動或靜止的時間超過這個閾值時，它會產生一個中斷或通知。
+	這個註冊器的數據格式是無符號的，這意味著它只能表示正數。每一位的增量或比例因子是62.5 mg，這意味著如果你在註冊器中設定了一個值，例如4，
+	那麼實際的閾值將是250 mg（4 x 62.5 mg）。如果這個值設定為0，並且不活動中斷被啟用，那麼任何微小的不活動都可能觸發中斷，
+	這可能不是使用者所期望的行為。因此，使用者應該根據他們的應用需求適當地設定這個閾值。
+
+Register 0x2C—BW_RATE (Read/Write)
+      D7 D6 D5    D4       D3-D0
+       0  0  0 LOW_POWER   Rate
+   LOW_POWER 位元：這是一個用於控制設備功耗模式的位元。當它被設置為0時，設備將在正常模式下運行。
+	               當它被設置為1時，設備將進入低功耗模式，但這會增加噪音。
+   Rate 位元：這些位元用於設定設備的頻寬和輸出數據速率。預設的輸出數據速率是100 Hz。
+	           使用者應該根據他們的通信協議和頻率選擇一個適當的輸出數據速率。如果選擇了一個過高的輸出數據速率，
+				  但通信速度很低，那麼一些數據樣本可能會被丟棄，這不是理想的情況。
+
+Register 0x2E—INT_ENABLE (Read/Write)
+       D7         D6         D5        D4
+   DATA_READY SINGLE_TAP DOUBLE_TAP Activity
+       D3         D2         D1        D0
+   Inactivity FREE_FALL   Watermark  Overrun
+   該暫存器用於控制哪些功能可以產生中斷。當暫存器中的某一位被設置為1時，與該位相對應的功能將被允許產生中斷。
+	相反，如果該位被設置為0，則該功能不會產生中斷。
+	特別地，DATA_READY、watermark和overrun這三個位只控制是否允許其相應的功能產生中斷輸出，但不影響這些功能本身的啟用狀態，這些功能始終是啟用的。
+   最後建議的做法是先配置中斷（即確定哪些功能應該產生中斷），然後再啟用它們的中斷輸出。這樣可以確保在中斷輸出被啟用之前，所有的配置都已正確設置。
+		  
+Register 0x2F—INT_MAP (R/W)
+	    D7        D6        D5        D4
+	DATA_READY SINGLE_TAP DOUBLE_TAP Activity
+	    D3         D2        D1        D0
+	Inactivity FREE_FALL Watermark   Overrun
+   該暫存器決定了中斷信號應該發送到哪個引腳。如果某一bit在這個暫存器中被設置為0，那麼與該bit相對應的中斷將被發送到INT1引腳。
+	相反，如果該位被設置為1，則中斷將被發送到INT2引腳。
+	如果選定了多個中斷發送到同一引腳，那麼這些中斷信號將會進行邏輯"or"操作，只要其中一個中斷被觸發，該引腳就會收到中斷信號。
+
+Register 0x30—INT_SOURCE (Read Only)
+		 D7          D6          D5           D4
+	DATA_READY, SINGLE_TAP, DOUBLE_TAP,   Activity
+		 D3         D2         D1        D0
+	Inactivity, FREE_FALL, Watermark, Overrun
+
+	DATA_READY: 這通常表示新的數據已經準備好並可以從感測器讀取。例如，當一個加速度計完成一次新的加速度測量時，
+					它可能會設置DATA_READY中斷來通知主控制器可以讀取新的數據。
+	SINGLE_TAP: 這通常表示感測器已經檢測到一次短暫的、快速的動作，就像某物被輕敲一下。在加速度計的上下文中，
+					這可能意味著裝置已經受到了一次短暫的撞擊或震動。
+	DOUBLE_TAP: 這表示感測器已經檢測到兩次短暫的、快速的動作，彼此之間的間隔非常短，就像某物被輕敲兩下。
+					這通常用於檢測特定的用戶輸入，例如雙擊裝置的表面。
+	Activity: 這表示感測器已經檢測到一定程度的動作或運動。例如，加速度計可能會使用此中斷來指示裝置已從靜止狀態變為移動狀態。
+	Inactivity: 這表示感測器在一段時間內沒有檢測到任何顯著的運動或動作。這可以用來檢測裝置是否已經放置不動一段時間，
+					可能用於進入低功耗模式或其他相關的功能。
+	FREE_FALL: 這表示感測器檢測到一種特定的運動模式，這通常與自由落體相符。當裝置突然下降（例如從桌子上掉下來）時，加速度計可能會觸發此中斷。
+	Watermark: 在FIFO（First In, First Out）緩衝區的上下文中，水印是一個預設的閾值，當緩衝區中的數據點數達到或超過這個值時，
+				  會觸發一個中斷。這允許主控制器知道現在是時候讀取一批數據，而不是等到緩衝區滿。
+	Overrun: 這表示FIFO緩衝區已滿，並且新的數據點已經開始覆蓋或丟棄最舊的數據。這是一個警告，表明主控制器沒有足夠快地讀取數據，導致數據丟失。
+
+Register 0x31—DATA_FORMAT (Read/Write) 
+	SPI 3Wires mode, 
+	FULL_RES bit is set to 0, the device is in 10-bit mode, 
+	Justify Bit=0, 表示讀進來的數值是2補數數值
+	range bit=2'b00, 表示是使用+-2g範圍
+
+
+
+
+
+
+
+
+*/

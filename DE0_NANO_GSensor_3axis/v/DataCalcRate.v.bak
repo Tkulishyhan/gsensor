@@ -1,0 +1,13 @@
+module  DataCalcRate(
+                 iClk50M,
+                 iRst_n,
+                 
+                 iDataValid,
+                 oDataRateSec,
+                 
+                 );
+
+                 
+
+
+endmodule

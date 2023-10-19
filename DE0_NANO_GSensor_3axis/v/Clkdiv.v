@@ -1,0 +1,143 @@
+// --------------------------------------------------------------------
+// Copyright (c) 2011 by TKU ICLAB. 
+// --------------------------------------------------------------------
+/*  use follow instruction to call the function
+
+Clkdiv #( .CLKFREQ(50000000), .EXCEPTCLK(10), .multipleX(4) ) UX1
+        (   
+            .iClk50M(iCLOCK_50), // 50Mhz clock 
+            .iRst_n(iRst_n),
+            .oError(oLEDG[0]),  // if CLKFREQ/2 great than ExpectClk, you will get a error
+            .oSampClk(oSampClk),  // multipleX expect clock, for SignalTap use
+            .oClk(wExpectClk)     // ExpectClk clock
+        );
+*/
+// Revision History :
+// --------------------------------------------------------------------
+//   Ver  :| Author            :| Mod. Date :| Changes Made:
+//   V1.0 :| Shih-An Li        :| 15/03/2011:| 1. Frequency Divider OK
+//                                             2. add error led. if CLKFREQ great than iClk50M /2
+//                                                you will get a error.
+//   V1.1 :| Shih-An Li        :| 18/05/2011:| 1. Add multipleX parameter
+//                                             2. fix oError signal
+//   V1.2 :| Shih-An Li        :| 18/05/2011:| 1. Add odd multipleX clock generate
+// --------------------------------------------------------------------
+`default_nettype none
+module Clkdiv    ( 
+                     iClk50M, // 50Mhz clock 
+                     iRst_n,
+                     oError,  // if CLKFREQCNTVALUE great than iClk50M /2, you will get a error
+                     oSampClk,  // multipleX expect clock, for SignalTap use
+                     oClk     // ExpectClk clock
+                 );
+                 
+//===========================================================================
+// PARAMETER declarations
+//===========================================================================
+parameter CLKFREQ = 50000000;  // clock frequency = 50M
+parameter EXCEPTCLK = 1;  // clock frequency = 1hz
+parameter multipleX = 100; // generate a multiple number of expect clk
+parameter WIDTH = 3;
+parameter N = CLKFREQ /EXCEPTCLK;   // multiple number of divider
+
+//===========================================================================
+// PORT declarations
+//===========================================================================
+input      iClk50M;  // input 50Mhz clock
+input      iRst_n;
+output     oError;   // Error of CLKFREQCNTVALUE input
+output reg oSampClk; // sample clock
+output     oClk;     // output except clock 
+
+//=============================================================================
+// REG/WIRE declarations
+//=============================================================================
+reg [$clog2((CLKFREQ /(EXCEPTCLK*2*multipleX)))-1:0] rSampClkCnt;
+
+
+reg [$clog2(N)-1:0] rCnt_p;
+reg [$clog2(N)-1:0] rCnt_n;
+reg                rClk_p;
+reg                rClk_n;
+//=============================================================================
+// Structural coding
+//=============================================================================
+
+// Generate expect frequency
+assign oClk  = (N == 1) ? iClk50M :
+               (N[0])   ? (rClk_p | rClk_n) : (rClk_p);
+               
+        
+always@(posedge iClk50M or negedge iRst_n) begin
+  if (!iRst_n)
+    rCnt_p <= 0;
+  else begin 
+    if (rCnt_p == (N-1))
+      rCnt_p <= 0;
+    else
+      rCnt_p <= rCnt_p + 'b1;
+  end
+end
+
+always@(posedge iClk50M or negedge iRst_n) begin
+  if (!iRst_n) 
+    rClk_p <= 1;
+  else begin
+      if (rCnt_p < (N>>1))
+        rClk_p = 1;
+      else
+        rClk_p = 0;    
+  end
+end
+
+always@(negedge iClk50M or negedge iRst_n) begin
+  if (!iRst_n)
+    rCnt_n <= 0;
+  else begin
+      if (rCnt_n == (N-1))
+        rCnt_n <= 0;
+      else
+        rCnt_n <= rCnt_n + 'b1;
+  end
+end
+
+always@(negedge iClk50M or negedge iRst_n) begin
+  if (!iRst_n)
+    rClk_n <= 1;
+  else begin
+      if (rCnt_n < (N>>1))
+        rClk_n = 1;
+      else
+        rClk_n = 0;
+  end
+end
+
+
+
+// generate sample clock ( = 2*expect clock) for SignalTap use
+always@(posedge iClk50M or negedge iRst_n) begin
+    if (!iRst_n) begin
+        oSampClk <= 0;
+        rSampClkCnt <= 0;
+    end
+    else begin
+        if(oError) begin 
+            oSampClk <= 0;
+            rSampClkCnt <= 0;
+        end
+        else if( rSampClkCnt >= (CLKFREQ /(EXCEPTCLK*2*multipleX)-1 ) )begin
+            oSampClk <= ~oSampClk;
+            rSampClkCnt <= 0;
+        end 
+        else begin
+            oSampClk <= oSampClk;  
+            rSampClkCnt <= rSampClkCnt +'b1;
+        end
+    end
+end
+
+// check except clock small than iClk/2 frequency
+assign oError = ((CLKFREQ/2) <= EXCEPTCLK) ? 1'b1: 1'b0;
+
+endmodule
+

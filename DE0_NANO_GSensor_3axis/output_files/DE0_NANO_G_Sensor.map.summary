@@ -1,0 +1,14 @@
+Analysis & Synthesis Status : Successful - Thu Oct 19 11:34:42 2023
+Quartus II 64-Bit Version : 13.0.1 Build 232 06/12/2013 SP 1 SJ Full Version
+Revision Name : DE0_NANO_G_Sensor
+Top-level Entity Name : DE0_NANO_G_Sensor
+Family : Cyclone IV E
+Total logic elements : 2,439
+    Total combinational functions : 1,079
+    Dedicated logic registers : 1,998
+Total registers : 1998
+Total pins : 51
+Total virtual pins : 0
+Total memory bits : 223,232
+Embedded Multiplier 9-bit elements : 0
+Total PLLs : 0

@@ -1,0 +1,3 @@
+Warning (10268): Verilog HDL information at Clkdiv.v(82): always construct contains both blocking and non-blocking assignments
+Warning (10268): Verilog HDL information at Clkdiv.v(104): always construct contains both blocking and non-blocking assignments
+Info (10281): Verilog HDL Declaration information at spi_param.h(11): object "READ_MODE" differs only in case from object "read_mode" in the same scope
